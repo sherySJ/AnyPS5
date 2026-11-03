@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+AGENT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+STATE="$AGENT_DIR/state"
+case "${1:-status}" in
+  status)
+    systemctl is-active --quiet anyps5-agent && echo "service: running" || echo "service: STOPPED"
+    [ -f "$STATE/PAUSE" ] && echo "paused: yes (anyps5 resume)"
+    echo "pushed today: $(cat "$STATE/count-$(date +%F)" 2>/dev/null || echo 0)"
+    [ -f "$STATE/control.json" ] && echo "captain settings: $(tr -d '\n' < "$STATE/control.json" | cut -c1-200)"
+    echo "your open upstream PRs: $(cat "$STATE/open-pr-count" 2>/dev/null || echo '?')  (limit 20; you already have a merged PR)"
+    echo "branches ready to open: $(ls "$STATE/ready" 2>/dev/null | wc -l)"
+    echo; echo "--- last log lines ---"; tail -n 15 "$STATE/agent.log" 2>/dev/null
+    echo; echo "--- latest report entries (full: anyps5 report) ---"; tail -n 20 "$STATE/report.md" 2>/dev/null ;;
+  report) ${PAGER:-less} "$STATE/report.md" ;;
+  log)    tail -f "$STATE/agent.log" ;;
+  attach) tmux attach -t anyps5 ;;
+  pause)  touch "$STATE/PAUSE"; echo "will pause after the current step" ;;
+  update) git -C "$(. "$AGENT_DIR/config.sh"; echo "$REPO")" fetch -q origin agent-control && git -C "$(. "$AGENT_DIR/config.sh"; echo "$REPO")" archive refs/remotes/origin/agent-control agent | tar x --strip-components=1 -C "$AGENT_DIR" && sudo systemctl restart anyps5-agent && echo "updated and restarted" ;;
+  resume) rm -f "$STATE/PAUSE"; echo "resumed" ;;
+  stop)   sudo systemctl stop anyps5-agent ;;
+  start)  sudo systemctl start anyps5-agent ;;
+  restart) sudo systemctl restart anyps5-agent ;;
+  *) echo "usage: anyps5 [status|report|log|attach|pause|resume|stop|start|restart|update]" ;;
+esac

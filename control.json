@@ -1,0 +1,9 @@
+{
+ "paused": false,
+ "daily_cap": 6,
+ "focus": [],
+ "skip": [],
+ "skip_libraries": [],
+ "followup_prs": [],
+ "notes": "Edited by the captain (scheduled cloud session). The VPS agent reads this every round."
+}
