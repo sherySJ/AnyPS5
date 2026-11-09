@@ -79,6 +79,7 @@ inline constexpr std::uint64_t MeshComputeOutputLimitBytes = 256ull << 20u;
 std::uint32_t MeshDrawLayers(const State& state);
 bool MeshDrawRunsAsCompute(bool meshShader, std::uint32_t maxMeshOutputLayers, const State& state);
 bool MeshDrawRunsAsCompute(const Context& context, const State& state);
+const ShaderRecompiler::RecompileResult& CachedMeshReadback(const ShaderRecompiler::RecompileResult& mesh);
 std::vector<CompiledShader> MeshComputeStages(const Context& context, const State& state, std::span<const CompiledShader> shaders);
 
 struct MeshArguments {

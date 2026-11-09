@@ -1343,30 +1343,38 @@ std::optional<MeshGrid> MeshComputeGridFor(const Context& context, std::uint32_t
     return MeshGrid{columns, instances, layers, layers > 1u ? columns : 0u};
 }
 
+const ShaderRecompiler::RecompileResult& CachedMeshReadback(const ShaderRecompiler::RecompileResult& mesh) {
+    Require(mesh.variantId != 0, "a mesh program run as compute needs a variant id");
+    static std::mutex mutex;
+    static std::map<std::uint64_t, std::unique_ptr<const ShaderRecompiler::RecompileResult>> readbacks;
+    std::lock_guard lock(mutex);
+    auto& entry = readbacks[mesh.variantId];
+    if (entry == nullptr) entry = std::make_unique<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshReadbackVertexShader(mesh, VK_API_VERSION_1_1));
+    return *entry;
+}
+
 std::vector<CompiledShader> MeshComputeStages(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
     if (!MeshDrawRunsAsCompute(context, state) || shaders.empty() || shaders.front().stage != Stage::Mesh) return {};
     Require(state.tessellationCapture == nullptr, "a mesh-path draw run as compute does not support tessellation capture");
-    Require(shaders.size() == 2u && shaders.front().program != nullptr && shaders.front().program->variantId != 0, "a mesh program run as compute needs one fragment stage and a variant id");
-    static std::mutex mutex;
-    static std::map<std::uint64_t, std::unique_ptr<const ShaderRecompiler::RecompileResult>> readbacks;
+    const bool patches = shaders.size() == 4u && shaders[1].stage == Stage::TessellationControl && shaders[2].stage == Stage::TessellationEvaluation;
+    Require((shaders.size() == 2u || patches) && shaders.front().program != nullptr && shaders.front().program->variantId != 0, "a mesh program run as compute needs one fragment stage, optional emulation patches and a variant id");
     const auto& mesh = *shaders.front().program;
     if (mesh.meshRecordLayout == 0u) {
         Require(context.meshShader, "a mesh-path draw run as compute needs its mesh program compiled with the compute record layout");
         return {};
     }
     Require(!mesh.meshBarycentrics.has_value(), "a mesh-path draw run as compute with barycentric fragment inputs needs the tessellation barycentrics path");
+    if (patches) {
+        Require(shaders.back().program != nullptr && shaders.back().program->barycentricEmulation.active && state.stages.mesh->outputPrimitiveSize == 3u, "mesh fallback patches require emulated barycentrics and triangle output");
+        Require(ShaderRecompiler::MeshRecordClipDistances(mesh.meshRecordLayout) == 0u && ShaderRecompiler::MeshRecordCullDistances(mesh.meshRecordLayout) == 0u && !ShaderRecompiler::MeshRecordLayer(mesh.meshRecordLayout), "mesh fallback patches do not preserve clip, cull or layer outputs");
+    }
     const auto host = mesh.hostSubgroupSize;
     const auto lanes = context.computeWave32 && (host == 32u || host > context.maxComputeSubgroupSize) ? std::min(host, context.maxComputeSubgroupSize) : context.subgroup.subgroupSize;
     Require(lanes >= state.stages.vertexWaveSize || (state.stages.vertexWaveSize == 64u && lanes == 32u && context.subgroup.subgroupSize == 32u), "a mesh-path draw run as compute needs compute subgroups at least as wide as its wave, or 32 lanes for a wave-64 program");
-    const ShaderRecompiler::RecompileResult* readback = nullptr;
-    {
-        std::lock_guard lock(mutex);
-        auto& entry = readbacks[mesh.variantId];
-        if (entry == nullptr) entry = std::make_unique<const ShaderRecompiler::RecompileResult>(ShaderRecompiler::BuildMeshReadbackVertexShader(mesh, VK_API_VERSION_1_1));
-        readback = entry.get();
-    }
-    return {{Stage::Compute, &mesh, shaders.front().pushConstantOffset}, {Stage::Vertex, readback, shaders.front().pushConstantOffset}, shaders.back()};
+    std::vector<CompiledShader> result{{Stage::Compute, &mesh, shaders.front().pushConstantOffset}, {Stage::Vertex, &CachedMeshReadback(mesh), shaders.front().pushConstantOffset}};
+    result.insert(result.end(), shaders.begin() + 1, shaders.end());
+    return result;
 }
 
 MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshArgumentRules& rules) {

@@ -249,6 +249,9 @@ function(add_shader_recompiler target runtimeTarget)
             BuildBarycentricTessellationShaders
             BuildMeshReadbackVertexShader
             MeshRecordBytes
+            MeshRecordClipDistances
+            MeshRecordCullDistances
+            MeshRecordLayer
             BuildPreparedShaderKey
             BuildRectListShaders
             BuildTessellationCaptureGeometryShader

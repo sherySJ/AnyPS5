@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
@@ -111,11 +112,15 @@ void CheckValidator(AgcDriver::VulkanDevice& device, const AgcDriver::Pm4::DrawP
     rejected(meshResult, plain, "mesh shading");
 }
 
-ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs) {
+ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs, bool fallback) {
     Pixels.fill(Unwritten);
     auto target = device.Target();
     target.fragmentShaderBarycentricEnabled = false;
     target.fragmentBarycentricBuiltins = false;
+    if (fallback) {
+        target.meshAsCompute = true;
+        target.meshWindowBuffer = false;
+    }
 
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Vertices.size()), 0, 1, 0, false};
     std::vector<std::uint32_t> meshUserData(12, 0u);
@@ -155,23 +160,28 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     fragment.useCache = false;
     auto pixelResult = ShaderRecompiler::Recompile(fragment);
     Require(pixelResult.barycentricEmulation.active, "the pixel shader did not emulate barycentrics");
-    mesh.graphics->meshBarycentrics = ShaderRecompiler::MeshBarycentricLayoutOf(pixelResult);
-    const auto pairedMesh = ShaderRecompiler::Recompile(mesh);
-    if (pixelCode.data() == BarycentricPixelCode.data()) {
-        auto last = mesh;
-        last.graphics->mesh->provokingVertex = 1u;
-        ExpectRejected([&] { static_cast<void>(ShaderRecompiler::Recompile(last)); }, "first provoking vertex");
-        auto wide = mesh;
-        wide.graphics->mesh->maxVertices = target.mesh->maxSharedMemoryBytes / 16u + 1u;
-        ExpectRejected([&] { static_cast<void>(ShaderRecompiler::Recompile(wide)); }, "mesh shared memory");
+    auto pairedMesh = meshResult;
+    if (!fallback) {
+        mesh.graphics->meshBarycentrics = ShaderRecompiler::MeshBarycentricLayoutOf(pixelResult);
+        pairedMesh = ShaderRecompiler::Recompile(mesh);
+        if (pixelCode.data() == BarycentricPixelCode.data()) {
+            auto last = mesh;
+            last.graphics->mesh->provokingVertex = 1u;
+            ExpectRejected([&] { static_cast<void>(ShaderRecompiler::Recompile(last)); }, "first provoking vertex");
+            auto wide = mesh;
+            wide.graphics->mesh->maxVertices = target.mesh->maxSharedMemoryBytes / 16u + 1u;
+            ExpectRejected([&] { static_cast<void>(ShaderRecompiler::Recompile(wide)); }, "mesh shared memory");
+        }
+        Require(pairedMesh.meshBarycentrics == mesh.graphics->meshBarycentrics, "the paired mesh does not record the layout it was compiled for");
+        Require(pairedMesh.pushConstants.size() == meshPush && pairedMesh.parameterExports == meshResult.parameterExports, "the paired mesh changed the push constants or exports the pixel shader was built for");
+    } else {
+        Require(pairedMesh.meshRecordLayout != 0u && !pairedMesh.meshBarycentrics.has_value(), "the mesh program run as compute was not compiled with the compute record layout");
     }
-    Require(pairedMesh.meshBarycentrics == mesh.graphics->meshBarycentrics, "the paired mesh does not record the layout it was compiled for");
-    Require(pairedMesh.pushConstants.size() == meshPush && pairedMesh.parameterExports == meshResult.parameterExports, "the paired mesh changed the push constants or exports the pixel shader was built for");
 
-    const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
+    std::vector<AgcDriver::Graphics::CompiledShader> shaders{
         {ShaderStage::Mesh, &pairedMesh, 0},
         {ShaderStage::Fragment, &pixelResult, PixelPushOffset(meshPush, target)}
-    }};
+    };
 
     AgcDriver::Graphics::State state{};
     state.stages = {AgcDriver::Graphics::ShaderPath::Geometry, 0x20u, 64u, 64u, SmallSubgroup, std::nullopt};
@@ -188,7 +198,17 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, std::spa
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
-    if (pixelCode.data() == BarycentricPixelCode.data()) CheckValidator(device, draw, state, pairedMesh, pixelResult, PixelPushOffset(meshPush, target));
+    if (!fallback && pixelCode.data() == BarycentricPixelCode.data()) CheckValidator(device, draw, state, pairedMesh, pixelResult, PixelPushOffset(meshPush, target));
+    std::vector<ShaderRecompiler::RecompileResult> generated;
+    if (fallback) {
+        const std::array<const ShaderRecompiler::RecompileResult*, 2> programResults{&pairedMesh, &pixelResult};
+        Require(AgcDriver::DriverDetail::MeshFallbackBarycentrics(programResults), "a mesh program compiled for the compute fallback was not routed as one");
+        AgcDriver::DriverDetail::InsertEmulatedBarycentricStages(device, state, draw, programResults, generated, shaders);
+        Require(generated.size() == 2u && shaders.size() == 4u && shaders[0].stage == ShaderStage::Mesh && shaders[1].stage == ShaderStage::TessellationControl && shaders[2].stage == ShaderStage::TessellationEvaluation && shaders[3].stage == ShaderStage::Fragment, "the mesh fallback routing did not insert the generated tessellation stages between the mesh program and the pixel shader");
+        Require(shaders[1].program == &generated[0] && shaders[2].program == &generated[1] && shaders[3].program == &pixelResult, "the mesh fallback stages do not point at the generated results");
+        const std::array<const ShaderRecompiler::RecompileResult*, 2> plain{&pixelResult, &pixelResult};
+        Require(!AgcDriver::DriverDetail::MeshFallbackBarycentrics(plain), "a program without the compute record layout was routed as a mesh fallback");
+    }
     device.Draw(state, draw, shaders);
     device.WaitIdle();
     return pixelResult;
@@ -275,34 +295,32 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        if (!device->Target().mesh.has_value()) {
-            std::puts("skipped, the device has no VK_EXT_mesh_shader");
+        const bool fallback = device->Target().meshAsCompute;
+        if (fallback && !device->Target().tessellation.has_value()) {
+            std::puts("skipped, the device has neither VK_EXT_mesh_shader nor tessellation shaders for the compute fallback");
             return VulkanTestSkipped;
         }
-        if (device->DeviceName().starts_with("llvmpipe")) {
+        if (!fallback && device->DeviceName().starts_with("llvmpipe")) {
             std::puts("skipped, the device has no mesh shader compiler that handles these programs (llvmpipe)");
-            return VulkanTestSkipped;
-        }
-        if (device->Target().meshAsCompute) {
-            std::puts("skipped, the compute fallback has no barycentric path (MeshComputeStages requires native mesh)");
             return VulkanTestSkipped;
         }
         for (std::size_t i = 0; i < Corners.size(); ++i) {
             const auto& corner = Corners[i];
             Vertices[i] = {{corner.x * corner.w, corner.y * corner.w, 0.5f * corner.w, corner.w}, {VertexValues[i], 0.0f, 0.0f, 1.0f}};
         }
+        const std::string route = fallback ? "mesh fallback" : "mesh";
         const auto perspective = PixelInputBit(PixelInput::PerspectiveCenter);
         const auto linear = PixelInputBit(PixelInput::LinearCenter);
-        auto result = Draw(*device, BarycentricPixelCode, perspective);
+        auto result = Draw(*device, BarycentricPixelCode, perspective, fallback);
         Require(result.barycentricEmulation.smooth && !result.barycentricEmulation.linear, "reading PERSP_CENTER I/J did not emulate perspective barycentrics");
-        const auto smooth = CheckBarycentrics("mesh PERSP_CENTER I/J", true);
-        result = Draw(*device, BarycentricPixelCode, linear);
+        const auto smooth = CheckBarycentrics(route + " PERSP_CENTER I/J", true);
+        result = Draw(*device, BarycentricPixelCode, linear, fallback);
         Require(!result.barycentricEmulation.smooth && result.barycentricEmulation.linear, "reading LINEAR_CENTER I/J did not emulate linear barycentrics");
-        const auto noPerspective = CheckBarycentrics("mesh LINEAR_CENTER I/J", false);
-        result = Draw(*device, VertexValuePixelCode, perspective);
+        const auto noPerspective = CheckBarycentrics(route + " LINEAR_CENTER I/J", false);
+        result = Draw(*device, VertexValuePixelCode, perspective, fallback);
         Require(result.barycentricEmulation.active && result.fragmentParameters.size() == 1 && result.fragmentParameters[0].perVertex, "v_interp_mov of P10 and P20 did not emulate per-vertex parameters");
         const auto vertexValues = CheckVertexValues();
-        std::printf("mesh barycentric emulation tests passed: %u perspective and %u linear I/J pixels, %u raw vertex value pixels\n", smooth, noPerspective, vertexValues);
+        std::printf("%s barycentric emulation tests passed: %u perspective and %u linear I/J pixels, %u raw vertex value pixels\n", route.c_str(), smooth, noPerspective, vertexValues);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
