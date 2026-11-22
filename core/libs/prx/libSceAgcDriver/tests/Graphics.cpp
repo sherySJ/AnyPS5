@@ -9213,7 +9213,7 @@ void pipelineLibraryClearWaitsForBuildTests() {
 
 void tessellationPipelineLibraryCacheTests() {
     using namespace AgcDriver::Graphics;
-    for (const auto shared : {true, false}) {
+    for (const auto [shared, mesh] : {std::pair{true, false}, std::pair{false, false}, std::pair{true, true}, std::pair{false, true}}) {
         mock = MockVulkan{};
         auto context = mockContext();
         context.graphicsPipelineLibrary = true;
@@ -9221,10 +9221,17 @@ void tessellationPipelineLibraryCacheTests() {
         context.tessellationPipelineCache = shared;
         context.limits.maxTessellationPatchSize = 32;
         context.limits.maxPushConstantsSize = 256;
+        context.limits.maxComputeWorkGroupInvocations = 32;
+        context.limits.maxComputeWorkGroupSize[0] = 32;
         context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
         State state{};
-        state.stages.path = ShaderPath::Tessellation;
-        state.stages.tessellation = ShaderRecompiler::TessellationConfiguration{3, 3, 2, 1, 4, 128, 16, false};
+        if (mesh) {
+            state.stages.path = ShaderPath::Geometry;
+            state.stages.mesh = ShaderRecompiler::MeshConfiguration{4, 1, 3, 3, 1, 32, 0, 0};
+        } else {
+            state.stages.path = ShaderPath::Tessellation;
+            state.stages.tessellation = ShaderRecompiler::TessellationConfiguration{3, 3, 2, 1, 4, 128, 16, false};
+        }
         ShaderRecompiler::RecompileResult vertex, control, evaluation, fragment;
         vertex.spirv = makeModule({});
         control.spirv = makeModule({});
@@ -9237,7 +9244,7 @@ void tessellationPipelineLibraryCacheTests() {
         const std::array<CompiledShader, 4> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::TessellationControl, &control, 0}, {ShaderRecompiler::ShaderStage::TessellationEvaluation, &evaluation, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
         std::array<std::uint32_t, 1> mainKey{31};
         const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, mainKey, {}};
-        Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders) == shared, shared ? "tessellation pipelines skipped graphics pipeline libraries with a shared pipeline cache" : "tessellation pipelines without the pipeline cache were built from graphics pipeline libraries");
+        Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders) == shared, mesh ? "generated mesh patches ignored the pipeline library cache policy" : shared ? "tessellation pipelines skipped graphics pipeline libraries with a shared pipeline cache" : "tessellation pipelines without the pipeline cache were built from graphics pipeline libraries");
         ClearPipelineLibraries(context.device);
         Require(mock.live == 0, "tessellation pipeline library tests leaked Vulkan objects");
     }
