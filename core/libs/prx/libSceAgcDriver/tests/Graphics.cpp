@@ -9243,6 +9243,59 @@ void tessellationPipelineLibraryCacheTests() {
     }
 }
 
+void meshTessellationPipelineCacheTests() {
+    using namespace AgcDriver::Graphics;
+    static VkPipelineCache expectedCache;
+    for (const auto shared : {true, false}) {
+        mock = MockVulkan{};
+        auto context = mockContext();
+        context.meshShader = false;
+        context.tessellationShader = true;
+        context.graphicsPipelineLibrary = true;
+        context.tessellationPipelineCache = shared;
+        context.pipelineCache = makeHandle<VkPipelineCache>();
+        expectedCache = shared ? context.pipelineCache : VK_NULL_HANDLE;
+        context.limits.maxTessellationPatchSize = 3;
+        context.limits.maxPushConstantsSize = 256;
+        context.limits.maxComputeWorkGroupInvocations = 32;
+        context.limits.maxComputeWorkGroupSize[0] = 32;
+        context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        context.deviceProc = +[](VkDevice device, const char* name) -> PFN_vkVoidFunction {
+            if (std::strcmp(name, "vkCreateGraphicsPipelines") == 0) {
+                return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkPipelineCache cache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) -> VkResult {
+                    Require(count == 1 && infos[0].pTessellationState != nullptr && infos[0].pTessellationState->patchControlPoints == 3u, "mesh barycentric emulation did not create a three-point patch pipeline");
+                    Require(infos[0].stageCount == 4u && infos[0].pInputAssemblyState != nullptr && infos[0].pInputAssemblyState->topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST, "mesh barycentric emulation did not keep the four graphics stages and patch topology");
+                    Require(cache == expectedCache, "mesh barycentric emulation ignored the tessellation pipeline cache policy");
+                    *pipelines = makeHandle<VkPipeline>();
+                    ++mock.live;
+                    return VK_SUCCESS;
+                });
+            }
+            if (std::strcmp(name, "vkCreateComputePipelines") == 0) {
+                return reinterpret_cast<PFN_vkVoidFunction>(+[](VkDevice, VkPipelineCache, std::uint32_t count, const VkComputePipelineCreateInfo*, const VkAllocationCallbacks*, VkPipeline* pipelines) -> VkResult {
+                    Require(count == 1, "mesh pipeline cache test expects one compute pipeline");
+                    *pipelines = makeHandle<VkPipeline>();
+                    ++mock.live;
+                    return VK_SUCCESS;
+                });
+            }
+            return mockProc(device, name);
+        };
+        State state{};
+        state.stages.path = ShaderPath::Geometry;
+        state.stages.mesh = ShaderRecompiler::MeshConfiguration{4, 1, 3, 3, 1, 32, 0, 0};
+        ShaderRecompiler::RecompileResult compute, vertex, control, evaluation, fragment;
+        for (auto* shader : {&compute, &vertex, &control, &evaluation, &fragment}) shader->spirv = makeModule({});
+        fragment.spirv = makeModule({.fragment = true});
+        const std::array<CompiledShader, 5> shaders{{{ShaderRecompiler::ShaderStage::Compute, &compute, 0}, {ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::TessellationControl, &control, 0}, {ShaderRecompiler::ShaderStage::TessellationEvaluation, &evaluation, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        {
+            const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, {}, {}};
+            Pipeline pipeline(context, state, VertexInputLayout{}, resources, shaders);
+        }
+        Require(mock.live == 0, "mesh tessellation pipeline cache tests leaked Vulkan objects");
+    }
+}
+
 void framebufferOwnerTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
@@ -13993,6 +14046,7 @@ int main(int argc, char** argv) {
         pipelineLibrarySetTests();
         pipelineLibraryClearWaitsForBuildTests();
         tessellationPipelineLibraryCacheTests();
+        meshTessellationPipelineCacheTests();
         framebufferOwnerTests();
         hdrComponentSwapTests();
         depthMaintenanceTests();
